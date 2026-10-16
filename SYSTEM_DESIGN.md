@@ -2,13 +2,22 @@
 
 **Target:** 10,000 req/min (≈167 req/s average) for summarization, document understanding and customer support. The service runs on vLLM with an open-source model, and quality has to match the external API it replaces.
 
-**Recommendation:** **gpt-oss-120b on 3 nodes of 8× H200 (24 GPUs), one vLLM replica per GPU.** A LiteLLM gateway sits in front, with a load-aware router behind it. The external API stays as overflow while the migration is in progress.
+**Recommendation:** **two model tiers on 3 nodes of 8× H200 (24 GPUs), one vLLM replica per GPU.** Gemma 4 26B A4B is the fast tier for quick summarization and document understanding; gpt-oss-120b is the deep-reasoning tier. A LiteLLM gateway sits in front, with a load-aware router behind it. The external API stays as overflow while the migration is in progress.
 
 ---
 
 ## 1. Proposed architecture
 
-### Model: gpt-oss-120b (Apache 2.0)
+### Models: two tiers, routed by use case at the gateway
+
+| Tier | Model | Why | Routes |
+|---|---|---|---|
+| **Fast** | **Gemma 4 26B A4B** (Apache 2.0) | MoE with 25B total and **3.8B active** parameters, so it's cheaper per token than gpt-oss. 256K context. **Image input**, so it reads scanned and PDF documents directly | Quick summarization, document understanding and extraction, support replies |
+| **Deep** | **gpt-oss-120b** (Apache 2.0) | 117B total, 5.1B active; stronger multi-step reasoning, adjustable reasoning effort | Complex document analysis, multi-step questions, escalations from the fast tier |
+
+The gateway routes by use case, and apps can request a tier explicitly. Each tier runs in its own GPU pool, and the split is set by measured traffic rather than fixed. Most traffic is expected to land on the fast tier, which **adds headroom** to the sizing below. The sizing below is worst-case: everything on gpt-oss-120b.
+
+#### Deep tier: gpt-oss-120b
 
 - **Why not the simulator's 8B model:** the quality bar is the external API we're replacing. An 8B model handles support replies and short summaries, but is likely to fall short on complex document understanding. If quality drops, the migration fails no matter how cheap it is.
 - **Big-model quality at small-model cost:**
@@ -18,7 +27,7 @@
 - **Reasoning effort is set per route:** `low` for support and summarization, higher only where it pays off (see challenge #2).
 - **Chosen by evaluation, not by size:**
   - Before committing, run a few hundred real prompts from the external API logs, with the API's outputs as references.
-  - Score gpt-oss-120b, **Muse Glimmer 30B** (Apache 2.0, multimodal, useful for scanned documents) and an 8B baseline.
+  - Score Gemma 4 26B A4B, gpt-oss-120b, **Muse Glimmer 30B** (Apache 2.0, multimodal; the challenger for the fast tier) and an 8B baseline.
   - For each use case, choose the smallest model that meets the quality bar. The gateway can then route each use case to a different model.
   - Muse Spark Open (816B) is left out for now: about 700 GB of VRAM, a license that needs legal review, and too new.
 
@@ -63,9 +72,8 @@ flowchart LR
   G --> Q[Async queue<br/>batch summarization]
   Q --> R
   G --> R[Router<br/>prefix-cache + load aware]
-  R --> V1[vLLM replica 1<br/>1× H200]
-  R --> V2[vLLM replica …]
-  R --> V3[vLLM replica 24]
+  R --> F[Fast pool<br/>Gemma 4 26B A4B<br/>vLLM, 1 per H200]
+  R --> D[Deep pool<br/>gpt-oss-120b<br/>vLLM, 1 per H200]
 ```
 
 1. **User → app (OAuth 2.0 / OIDC):** users sign in to the app through the company identity provider (Okta or Entra ID).

@@ -140,6 +140,6 @@ In production, I'd add hardware metrics from DCGM (SM utilization, HBM usage, te
 ## Part 3: Scaling to production
 
 See [SYSTEM_DESIGN.md](SYSTEM_DESIGN.md), the memo on reaching 10,000 req/min. It covers:
-- **model:** gpt-oss-120b
+- **models:** Gemma 4 26B A4B (fast tier) and gpt-oss-120b (deep tier)
 - **hardware:** 3 nodes of 8× H200
 - **the rest:** request flow through a LiteLLM gateway, load-aware routing, the observability pipeline, scaling challenges, and reliability
