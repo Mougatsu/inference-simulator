@@ -137,11 +137,9 @@ For dashboards, I'd also watch the following (no alerts needed):
 
 In production, I'd add hardware metrics from DCGM (SM utilization, HBM usage, temperature, ECC/XID errors) and per-tenant labels for chargeback.
 
-## Production next steps (not built)
+## Part 3: Scaling to production
 
-- **LLM gateway (LiteLLM) in front of vLLM:**
-  - one OpenAI-compatible API for every app
-  - fallback to the external provider during migration, since a single H100 has no redundancy
-  - per-team keys and budgets
-  - a rule that sensitive document traffic never goes to the fallback
-- **Routing:** with 2+ replicas, use prefix-cache-aware or least-busy routing, for example with the vLLM production-stack router.
+See [SYSTEM_DESIGN.md](SYSTEM_DESIGN.md), the memo on reaching 10,000 req/min. It covers:
+- **model:** gpt-oss-120b
+- **hardware:** 3 nodes of 8× H200
+- **the rest:** request flow through a LiteLLM gateway, load-aware routing, the observability pipeline, scaling challenges, and reliability

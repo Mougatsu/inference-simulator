@@ -1,0 +1,157 @@
+# Part 3 – Scaling to Production: 10,000 requests/min
+
+**Target:** 10,000 req/min (≈167 req/s average) for summarization, document understanding and customer support. The service runs on vLLM with an open-source model, and quality has to match the external API it replaces.
+
+**Recommendation:** **gpt-oss-120b on 3 nodes of 8× H200 (24 GPUs), one vLLM replica per GPU.** A LiteLLM gateway sits in front, with a load-aware router behind it. The external API stays as overflow while the migration is in progress.
+
+---
+
+## 1. Proposed architecture
+
+### Model: gpt-oss-120b (Apache 2.0)
+
+- **Why not the simulator's 8B model:** the quality bar is the external API we're replacing. An 8B model handles support replies and short summaries, but is likely to fall short on complex document understanding. If quality drops, the migration fails no matter how cheap it is.
+- **Big-model quality at small-model cost:**
+  - It's a mixture-of-experts model with 117B total parameters but only about 5.1B active per token.
+  - Per-token compute stays close to a small model's.
+  - It fits on **one GPU** (about 61 GB in MXFP4), and vLLM support is mature.
+- **Reasoning effort is set per route:** `low` for support and summarization, higher only where it pays off (see challenge #2).
+- **Chosen by evaluation, not by size:**
+  - Before committing, run a few hundred real prompts from the external API logs, with the API's outputs as references.
+  - Score gpt-oss-120b, **Muse Glimmer 30B** (Apache 2.0, multimodal, useful for scanned documents) and an 8B baseline.
+  - For each use case, choose the smallest model that meets the quality bar. The gateway can then route each use case to a different model.
+  - Muse Spark Open (816B) is left out for now: about 700 GB of VRAM, a license that needs legal review, and too new.
+
+### Required hardware
+
+**Sizing is based on tokens, not requests.** A 2,000-token document costs about 100× more than a support question.
+- **Planning mix:** about **1,500 prompt tokens and 200 output tokens per request**, which is document-heavy. Our Dolly dataset averages about 90 in and 75 out, which would undersize the cluster.
+- **Method:** the same resource model as the simulator, with gpt-oss-120b's constants:
+  - weights about 61 GB
+  - KV cache about 37 KB per token (only half the layers keep full attention)
+  - prefill about 25k tok/s
+
+| | H100 80GB | **H200 141GB** |
+|---|---|---|
+| KV cache room after weights | ~190k tokens (≈110 concurrent requests) | ~1.7M tokens (256 concurrent, the batch limit) |
+| Throughput per GPU | ~10 req/s | ~14 req/s |
+| GPUs needed at 100% busy | 16.4 | 12.2 |
+| **Deployment** | 4 nodes × 8 = 32 GPUs | **3 nodes × 8 = 24 GPUs** |
+| Normal load / one node lost | 51% / 68% busy | **51% / 76% busy** |
+
+- **Why H200:** the extra HBM goes to KV cache, so each GPU can batch more requests and handle long documents.
+- **Same cost, fewer nodes:** 24 H200s cost about as much as 32 H100s, and leave fewer nodes to operate.
+- **One node can fail without needing the external API:** that's N+1 redundancy by itself.
+- **H100 caveat:** H100 has no native MXFP4 support and uses a software fallback.
+- **These numbers are estimates.** Before buying, benchmark one GPU with `vllm bench` on the real prompt mix and recalibrate the simulator.
+
+**Supporting hardware:**
+- **Network:** 100–200 GbE is enough. Each replica runs on one GPU, so there's no traffic between GPUs, and InfiniBand isn't needed.
+- **Storage:** local NVMe on each node caches the weights, so a replica starts in seconds instead of downloading about 61 GB.
+- **CPU:** a small CPU node pool runs the gateway, router and monitoring.
+
+### Request flow: application → inference cluster
+
+```mermaid
+flowchart LR
+  A[Apps<br/>summarization · docs · support] -->|OpenAI-compatible API| G[LiteLLM gateway<br/>2+ replicas]
+  G -->|non-sensitive overflow only| X[External API]
+  G --> Q[Async queue<br/>batch summarization]
+  Q --> R
+  G --> R[Router<br/>prefix-cache + load aware]
+  R --> V1[vLLM replica 1<br/>1× H200]
+  R --> V2[vLLM replica …]
+  R --> V3[vLLM replica 24]
+```
+
+1. **App → gateway:** the app calls the **LiteLLM gateway** with a per-team key. One OpenAI-compatible API means apps don't change when the model changes.
+2. **Gateway:**
+   - authenticates the request and enforces team quotas and rate limits
+   - assigns a priority: interactive support ranks above document understanding, which ranks above batch summarization
+   - picks the model and route for the use case
+   - enforces the **compliance rule:** requests tagged sensitive never go to the external API
+3. **Async traffic:** batch summarization that isn't time-sensitive goes to a **queue** and is processed when there's capacity.
+4. **Router → replica:** the **router** (vLLM production-stack router or llm-d) picks a vLLM replica.
+5. **vLLM** runs the request with chunked prefill, prefix caching and FP8 KV cache. It returns the output with exact token `usage`, from the model's own tokenizer.
+
+### Load balancing strategy
+
+- **Not round-robin:** requests differ in cost by 100×, so spreading them evenly by count leaves replicas unevenly loaded.
+- **Least-loaded first:** the router picks by live **queue depth and KV cache usage**, read from each replica's metrics.
+- **Prefix-cache affinity:** requests sharing a prefix (the same system prompt or the same document) go to the replica that already holds it in KV cache. That skips the repeated prefill, which is the expensive part of this workload.
+- **Priority:** the gateway enforces priority, so batch work can't starve interactive traffic.
+- **One replica per GPU:** the whole model fits on one GPU, so there's no splitting across GPUs. That gives the best throughput per GPU, and one failure takes down only 1/24 of capacity.
+
+### Observability pipeline
+
+- **Metrics:**
+  - sources: vLLM `/metrics` (the same metrics as our simulator), the DCGM exporter (GPU clocks, temperature, memory, XID/ECC errors) and the gateway (per team, per route, overflow and fallback rates)
+  - collected by **Prometheus**, with Mimir for HA and long retention
+  - shown in **Grafana**: the simulator dashboard plus a per-replica view
+  - routed through **Alertmanager** to PagerDuty and Slack
+- **Logs:** structured per-request logs from the gateway (request ID, team, model, tokens, latency, `finish_reason`) go to Loki. **They contain no prompt or output text**, for compliance.
+- **Tracing:** OpenTelemetry traces app → gateway → router → vLLM, so one slow request can be traced to queueing, prefill or decode.
+- **SLOs:** p95 TTFT, p95 TPOT and success rate per route. Alerting is based on how fast the error budget is used up.
+- **Cost:** a cost-per-million-tokens dashboard compared against the old API bill. That's the business case, measured.
+
+---
+
+## 2. Scaling challenges and proposed solutions
+
+| # | Challenge | Solution |
+|---|---|---|
+| 1 | **Prefill dominates.** Long documents take about 60 ms of GPU time each, and big prefills stall token generation for everyone sharing the batch | Chunked prefill; prefix caching for shared documents and system prompts; a separate replica pool for long documents vs. interactive traffic; later, split prefill and decode onto separate GPUs (disaggregation) |
+| 2 | **Reasoning tokens inflate output.** gpt-oss "thinks" before answering, and high reasoning effort can multiply output tokens | Reasoning effort set per route at the gateway (`low` by default); track output tokens per request by route; cap `max_tokens` |
+| 3 | **KV cache pressure** from long contexts reduces how many requests fit in a batch | H200 memory; FP8 KV cache; a `max_model_len` limit per route; alert on preemptions and on KV usage above 90% |
+| 4 | **Uneven load** across replicas | Load-aware, prefix-aware routing (above) |
+| 5 | **Slow scale-up.** A new GPU node takes minutes to start, and the weights are about 61 GB | Scale on queue depth and KV usage, not CPU; keep warm headroom (51% normal load); pre-pulled images and weights cached on NVMe; reserved capacity for the base load |
+| 6 | **Noisy neighbours** between teams | Per-team quotas, priority classes, and separate pools if one team's traffic shape hurts others |
+| 7 | **Model and config upgrades** | Canary releases through weighted routing at the gateway, gated by the evaluation suite; pinned model versions; the previous version kept deployable for rollback |
+| 8 | **Traffic growth** beyond 10k/min | Add nodes, since replicas are independent and capacity grows linearly. Recalibrate the simulator with production metrics to plan each step |
+
+---
+
+## 3. Reliability
+
+### Spikes that were previously absorbed by external APIs
+
+The external API used to provide effectively unlimited burst capacity. A fixed GPU cluster doesn't, so spikes are handled in layers, cheapest first:
+
+1. **Headroom:** normal load runs at about 51% GPU busy, so routine spikes of up to about 2× fit without any action.
+2. **Shift and shed by priority:**
+   - batch summarization moves to the async queue and is processed after the spike
+   - interactive support keeps its latency SLO
+3. **Overflow to the external API:** when cluster TTFT or queue depth crosses a threshold, the gateway sends **non-sensitive** traffic to the external provider. Keep that contract as a burst tier during migration. Sensitive traffic is never sent outside; it queues instead.
+4. **Admission control:** past that point, return `429` with `Retry-After`, as the simulator does, instead of letting queues and latency grow without bound.
+5. **Autoscaling** adds nodes for sustained growth. It's too slow for spikes lasting seconds, which steps 1–4 handle.
+
+### Partial GPU failure
+
+- **Detection:**
+  - vLLM `/health`, plus DCGM XID and ECC errors
+  - the request error rate of each replica
+- **Isolation:** the router removes the failed replica within seconds. With one replica per GPU, losing a GPU means losing 1/24 of capacity.
+- **Retries:**
+  - the gateway retries failed requests once on another replica
+  - for streaming requests, only if no tokens were sent yet
+  - this is safe because generation has no side effects
+- **Recovery:** Kubernetes reschedules the replica onto a healthy GPU, and nodes with hardware faults are cordoned and drained.
+- **Blast radius:** replicas are spread across all 3 nodes, with PodDisruptionBudgets. **Losing a whole node** leaves 16 GPUs at about 76% busy: still within SLO, with no external API needed.
+
+### Degraded model performance
+
+**Slow, but still answering.** Causes include thermal throttling, a bad driver or kernel, or a misconfigured replica.
+- Compare each replica's TPOT and tokens per second against the fleet median.
+- Watch DCGM clock and temperature metrics.
+- Automatically remove outlier replicas from rotation and investigate. A slow replica hurts the p95 of every request routed to it.
+
+**Worse output quality.** Causes include a new model, a quantization or config change, a reasoning-effort change, or a shift in incoming traffic.
+- **Before rollout:** run the golden-set evaluation in CI for every model or config change.
+- **During rollout:** canary 5% of traffic. Roll back automatically on these signals:
+  - evaluation scores on sampled traffic
+  - user thumbs-down rate
+  - the rate of empty or truncated output
+  - the `finish_reason=length` rate
+  - refusal rate
+- **During migration:** shadow a sample of non-sensitive traffic against the external API and compare the answers. This is the evidence that the self-hosted model really matches quality.
+- **Fallback:** for a route whose quality alert fires, the gateway can send it back to the previous model version, or to the external API for non-sensitive traffic, without redeploying anything.
