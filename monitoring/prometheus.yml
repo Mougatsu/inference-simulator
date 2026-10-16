@@ -1,0 +1,10 @@
+global:
+  scrape_interval: 5s       # short for the demo; 15-30s is typical in production
+  evaluation_interval: 5s
+
+rule_files: [alerts.yml]
+
+scrape_configs:
+  - job_name: inference-simulator
+    static_configs:
+      - targets: ["host.docker.internal:8000"]

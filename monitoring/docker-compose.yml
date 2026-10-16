@@ -1,0 +1,25 @@
+# Prometheus + Grafana for the simulator. The simulator runs on the host (uvicorn on :8000).
+# Run: docker compose -f monitoring/docker-compose.yml up -d
+#   Grafana    http://localhost:3000  (dashboard "LLM Inference Simulator")
+#   Prometheus http://localhost:9090/alerts
+services:
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    ports: ["9090:9090"]
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./alerts.yml:/etc/prometheus/alerts.yml:ro
+    extra_hosts: ["host.docker.internal:host-gateway"]  # lets Linux reach the host like Docker Desktop does
+
+  grafana:
+    image: grafana/grafana:11.4.0
+    ports: ["3000:3000"]
+    environment:
+      # ponytail: anonymous admin, local demo only. Real deployment: SSO + viewer role.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/inference.json
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro

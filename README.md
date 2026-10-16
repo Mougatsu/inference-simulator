@@ -20,6 +20,7 @@ locust --host http://localhost:8000 --headless -u 128 -r 32 -t 60s   # headless
 | `data/prompts.jsonl` | Dataset: 1000 records |
 | `data/prepare_dataset.py` | Rebuilds the dataset from the source |
 | `locustfile.py` | Stress test: each Locust user is one client sending requests back to back |
+| `monitoring/` | Prometheus with the alert rules, and a Grafana dashboard (Docker Compose) |
 
 ## Dataset
 
@@ -109,6 +110,25 @@ Choices:
 | Rejections | `rate(requests_total{status="rejected"}) > 0` | Load is being shed and users are getting errors. Page someone |
 | Error rate | non-ok / total > 1% | Something is broken |
 | Low utilization | `rate(gpu_busy) < 0.3` for 1h during business hours | Paying for an idle H100. Consolidate the workload or shrink the fleet |
+
+These rules are implemented in [`monitoring/alerts.yml`](monitoring/alerts.yml). Their `for` durations are shortened so the alerts fire within a demo; each rule's `production_for` annotation holds the production value.
+
+### Dashboard (Prometheus + Grafana)
+
+```
+uvicorn server:app --host 0.0.0.0 --port 8000        # 0.0.0.0 so the Prometheus container can scrape it
+docker compose -f monitoring/docker-compose.yml up -d
+locust --host http://localhost:8000 --headless -u 400 -r 100 -t 120s   # past the 256 batch limit
+```
+
+**Grafana** (http://localhost:3000) opens the "LLM Inference Simulator" dashboard, with no login:
+- an alerts table showing pending and firing alerts
+- headline stats: requests/s, tokens/s, GPU busy, KV cache, running, waiting and 429s
+- latency, queue, GPU, KV cache and error charts, with each alert's threshold drawn on the chart
+
+**Prometheus** (http://localhost:9090/alerts) shows the raw alert rule states.
+
+With 400 users, `QueueBacklog` and `TTFTHigh` fire within about a minute. `GPUUnderutilized` fires when the simulator sits idle. `KVCachePressure` never fires with an 8B model, because the 256-sequence limit is reached first, as explained above.
 
 For dashboards, I'd also watch the following (no alerts needed):
 - request rate by category

@@ -1,0 +1,67 @@
+# The alerts from the README. `for` durations are shortened so they fire within a demo;
+# the production value is in each alert's `production_for` annotation.
+groups:
+  - name: inference-simulator
+    rules:
+      - alert: SimulatorDown
+        expr: up{job="inference-simulator"} == 0
+        for: 30s
+        labels: {severity: critical}
+        annotations:
+          summary: Inference server is not answering /metrics
+          production_for: 1m
+
+      - alert: TTFTHigh
+        expr: histogram_quantile(0.95, sum by (le) (rate(sim_time_to_first_token_seconds_bucket[1m]))) > 2
+        for: 30s
+        labels: {severity: warning}
+        annotations:
+          summary: p95 time-to-first-token above 2s. Users are waiting, usually on the queue; scale out.
+          production_for: 5m
+
+      - alert: TPOTHigh
+        expr: histogram_quantile(0.95, sum by (le) (rate(sim_time_per_output_token_seconds_bucket[1m]))) > 0.05
+        for: 1m
+        labels: {severity: warning}
+        annotations:
+          summary: p95 time-per-output-token above 50ms. The batch is too large or prefill is interfering.
+          production_for: 10m
+
+      - alert: QueueBacklog
+        expr: sim_num_requests_waiting > 0
+        for: 30s
+        labels: {severity: warning}
+        annotations:
+          summary: Requests are queueing. The batch is full (256), so add a replica.
+          production_for: 5m
+
+      - alert: KVCachePressure
+        expr: sim_kv_cache_usage_ratio > 0.9
+        for: 1m
+        labels: {severity: warning}
+        annotations:
+          summary: KV cache above 90%. Preemption is coming; cut concurrency or max context.
+          production_for: 5m
+
+      - alert: RequestsRejected
+        expr: sum(rate(sim_requests_total{status="rejected"}[1m])) > 0
+        labels: {severity: critical}
+        annotations:
+          summary: The queue is full and requests are getting 429s. Load is being shed.
+          production_for: 0m
+
+      - alert: ErrorRateHigh
+        expr: sum(rate(sim_requests_total{status!="ok"}[5m])) / sum(rate(sim_requests_total[5m])) > 0.01
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: More than 1% of requests are failing.
+          production_for: 5m
+
+      - alert: GPUUnderutilized
+        expr: rate(sim_gpu_busy_seconds_total[5m]) < 0.3
+        for: 2m
+        labels: {severity: info}
+        annotations:
+          summary: GPU below 30% busy. You are paying for an idle H100.
+          production_for: 1h (business hours)
