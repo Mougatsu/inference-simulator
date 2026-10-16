@@ -31,12 +31,15 @@ Each record is `{id, category, prompt, response}`. The prompt is the instruction
 
 | | p50 | p99 | max |
 |---|---|---|---|
-| prompt tokens | 15 | 969 | 1748 |
-| completion tokens | 40 | 540 | 1592 |
+| prompt tokens | 15 | 998 | 1944 |
+| completion tokens | 37 | 549 | 1635 |
 
 ## Part 1: Inference simulation
 
-**Tokenizer:** [tiktoken](https://github.com/openai/tiktoken) `cl100k_base`. Llama 3's 128k vocabulary is built on cl100k's 100k BPE merges plus 28k extra tokens, so the counts land within a few percent of the real model's tokenizer. Using it avoids downloading the gated Llama tokenizer files. Earlier versions used a `len(text) / 4` heuristic, which can be off by 10–20% per request.
+**Tokenizer:** `tokens = max(1, round(len(text) / 4.6))`.
+- **Where 4.6 comes from:** I calibrated the ratio by running tiktoken `cl100k_base` over this dataset, which averages 4.58 characters per token. cl100k is the base of Llama 3's 128k vocabulary, so it's a close stand-in for the served model's tokenizer.
+- **Why not the usual `len/4`:** it overcounts this dataset by about 13%.
+- **Limits:** the formula is accurate on average, not per request. Text full of names or non-English words packs fewer characters into each token. For example, the first 200 characters of the Bismarck prompt (id 636) average about 2.9 characters per token, so the formula gives 43 tokens where cl100k counts 68. Tokenizers are model-specific. In production you don't estimate: vLLM returns exact `usage` counts from the served model's own tokenizer.
 
 **Engine:** a single asyncio task owns the "GPU" and runs **continuous batching** the way vLLM's scheduler does. Each loop iteration is one engine step. The stages are commented in `server.py`:
 
@@ -113,3 +116,12 @@ For dashboards, I'd also watch the following (no alerts needed):
 - tokens per GPU-second, which is the efficiency trend
 
 In production, I'd add hardware metrics from DCGM (SM utilization, HBM usage, temperature, ECC/XID errors) and per-tenant labels for chargeback.
+
+## Production next steps (not built)
+
+- **LLM gateway (LiteLLM) in front of vLLM:**
+  - one OpenAI-compatible API for every app
+  - fallback to the external provider during migration, since a single H100 has no redundancy
+  - per-team keys and budgets
+  - a rule that sensitive document traffic never goes to the fallback
+- **Routing:** with 2+ replicas, use prefix-cache-aware or least-busy routing, for example with the vLLM production-stack router.
