@@ -28,11 +28,11 @@ groups:
           production_for: 10m
 
       - alert: QueueBacklog
-        expr: sim_num_requests_waiting > 0
+        expr: sum(sim_num_requests_waiting) > 0
         for: 30s
         labels: {severity: warning}
         annotations:
-          summary: Requests are queueing. The batch is full (256), so add a replica.
+          summary: Requests are queueing. Both replicas' batches are full (2 x 256), so add a replica.
           production_for: 5m
 
       - alert: KVCachePressure
@@ -40,7 +40,7 @@ groups:
         for: 1m
         labels: {severity: warning}
         annotations:
-          summary: KV cache above 90%. Preemption is coming; cut concurrency or max context.
+          summary: KV cache above 90% on GPU {{ $labels.gpu }}. Preemption is coming; cut concurrency or max context.
           production_for: 5m
 
       - alert: RequestsRejected
@@ -59,9 +59,9 @@ groups:
           production_for: 5m
 
       - alert: GPUUnderutilized
-        expr: rate(sim_gpu_busy_seconds_total[5m]) < 0.3
+        expr: avg(rate(sim_gpu_busy_seconds_total[5m])) < 0.3
         for: 2m
         labels: {severity: info}
         annotations:
-          summary: GPU below 30% busy. You are paying for an idle H100.
+          summary: GPUs below 30% busy on average. You are paying for idle H200s.
           production_for: 1h (business hours)

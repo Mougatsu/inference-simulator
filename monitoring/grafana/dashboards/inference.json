@@ -1,6 +1,6 @@
 {
   "uid": "inference-sim",
-  "title": "LLM Inference Simulator",
+  "title": "LLM Inference Simulator (2x H200, Gemma 4 26B A4B)",
   "schemaVersion": 39,
   "refresh": "5s",
   "time": {
@@ -199,7 +199,7 @@
     {
       "id": 4,
       "type": "stat",
-      "title": "GPU busy",
+      "title": "GPU busy (avg)",
       "datasource": {
         "type": "prometheus",
         "uid": "prom"
@@ -236,14 +236,14 @@
             "uid": "prom"
           },
           "refId": "A",
-          "expr": "rate(sim_gpu_busy_seconds_total[1m])"
+          "expr": "clamp_max(avg(rate(sim_gpu_busy_seconds_total[1m])), 1)"
         }
       ]
     },
     {
       "id": 5,
       "type": "stat",
-      "title": "KV cache used",
+      "title": "KV cache used (max GPU)",
       "datasource": {
         "type": "prometheus",
         "uid": "prom"
@@ -284,14 +284,14 @@
             "uid": "prom"
           },
           "refId": "A",
-          "expr": "sim_kv_cache_usage_ratio"
+          "expr": "max(sim_kv_cache_usage_ratio)"
         }
       ]
     },
     {
       "id": 6,
       "type": "stat",
-      "title": "Running (max 256)",
+      "title": "Running (max 2 x 256)",
       "datasource": {
         "type": "prometheus",
         "uid": "prom"
@@ -314,7 +314,7 @@
               },
               {
                 "color": "red",
-                "value": 256
+                "value": 512
               }
             ]
           },
@@ -332,7 +332,7 @@
             "uid": "prom"
           },
           "refId": "A",
-          "expr": "sim_num_requests_running"
+          "expr": "sum(sim_num_requests_running)"
         }
       ]
     },
@@ -380,7 +380,7 @@
             "uid": "prom"
           },
           "refId": "A",
-          "expr": "sim_num_requests_waiting"
+          "expr": "sum(sim_num_requests_waiting)"
         }
       ]
     },
@@ -555,7 +555,7 @@
     {
       "id": 11,
       "type": "timeseries",
-      "title": "Batch vs queue (alert: waiting > 0)",
+      "title": "Batch vs queue per GPU (max batch 256, alert: waiting > 0)",
       "datasource": {
         "type": "prometheus",
         "uid": "prom"
@@ -599,7 +599,7 @@
           },
           "refId": "A",
           "expr": "sim_num_requests_running",
-          "legendFormat": "running"
+          "legendFormat": "running GPU {{gpu}}"
         },
         {
           "datasource": {
@@ -608,7 +608,7 @@
           },
           "refId": "B",
           "expr": "sim_num_requests_waiting",
-          "legendFormat": "waiting"
+          "legendFormat": "waiting GPU {{gpu}}"
         }
       ]
     },
@@ -725,8 +725,8 @@
             "uid": "prom"
           },
           "refId": "A",
-          "expr": "rate(sim_gpu_busy_seconds_total[1m])",
-          "legendFormat": "busy"
+          "expr": "clamp_max(rate(sim_gpu_busy_seconds_total[1m]), 1)",
+          "legendFormat": "GPU {{gpu}}"
         }
       ]
     },
@@ -777,7 +777,7 @@
           },
           "refId": "A",
           "expr": "sim_kv_cache_usage_ratio",
-          "legendFormat": "used"
+          "legendFormat": "GPU {{gpu}}"
         }
       ]
     },

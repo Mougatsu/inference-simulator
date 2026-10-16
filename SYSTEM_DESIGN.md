@@ -12,14 +12,22 @@
 
 | Tier | Model | Why | Routes |
 |---|---|---|---|
-| **Fast** | **Gemma 4 26B A4B** (Apache 2.0) | MoE with 25B total and **3.8B active** parameters, so it's cheaper per token than gpt-oss. 256K context. **Image input**, so it reads scanned and PDF documents directly | Quick summarization, document understanding and extraction, support replies |
+| **Fast** | **Gemma 4 26B A4B** (Apache 2.0) | MoE with 25B total and **3.8B active** parameters, so it has low latency at moderate load and a cheaper prefill. 256K context. **Image input**, so it reads scanned and PDF documents directly | Quick summarization, document understanding and extraction, support replies |
 | **Deep** | **gpt-oss-120b** (Apache 2.0) | 117B total, 5.1B active; stronger multi-step reasoning, adjustable reasoning effort | Complex document analysis, multi-step questions, escalations from the fast tier |
 
-The gateway routes by use case, and apps can request a tier explicitly. Each tier runs in its own GPU pool, and the split is set by measured traffic rather than fixed. Most traffic is expected to land on the fast tier, which **adds headroom** to the sizing below. The sizing below is worst-case: everything on gpt-oss-120b.
+The gateway routes by use case, and apps can request a tier explicitly. Each tier runs in its own GPU pool, and the split is set by measured traffic rather than fixed.
+
+**The hybrid buys capability and latency, not capacity.** Using the simulator's resource model on the planning mix below (1,500 tokens in, 200 out, full batches), both tiers cost about the same: **~13.6 req/s per H200 for Gemma 4, ~13.1 for gpt-oss**.
+- **Why they cost the same:** prefill dominates, and Gemma's sliding-window layers hold a large KV cache for each request's first 1K tokens.
+- **Where Gemma wins:** lower latency at moderate load (a small batch reads only a slice of the expert weights), image input, and a cheaper prefill.
+- **Where gpt-oss wins:** reasoning depth.
+- **What this means for sizing:** the hardware below holds **for any traffic split** between the two tiers.
+
+The simulator in Parts 1–2 models the fast tier: Gemma 4 26B A4B on 2× H200.
 
 #### Deep tier: gpt-oss-120b
 
-- **Why not the simulator's 8B model:** the quality bar is the external API we're replacing. An 8B model handles support replies and short summaries, but is likely to fall short on complex document understanding. If quality drops, the migration fails no matter how cheap it is.
+- **Why not a single small model:** the quality bar is the external API we're replacing. A small model handles support replies and short summaries, but is likely to fall short on complex multi-step document analysis. If quality drops, the migration fails no matter how cheap it is.
 - **Big-model quality at small-model cost:**
   - It's a mixture-of-experts model with 117B total parameters but only about 5.1B active per token.
   - Per-token compute stays close to a small model's.
@@ -35,7 +43,7 @@ The gateway routes by use case, and apps can request a tier explicitly. Each tie
 
 **Sizing is based on tokens, not requests.** A 2,000-token document costs about 100× more than a support question.
 - **Planning mix:** about **1,500 prompt tokens and 200 output tokens per request**, which is document-heavy. Our Dolly dataset averages about 90 in and 75 out, which would undersize the cluster.
-- **Method:** the same resource model as the simulator, with gpt-oss-120b's constants:
+- **Method:** the same resource model as the simulator. The table uses gpt-oss-120b's constants, the slightly more expensive tier, so it's a safe bound for any split:
   - weights about 61 GB
   - KV cache about 37 KB per token (only half the layers keep full attention)
   - prefill about 25k tok/s
@@ -53,6 +61,76 @@ The gateway routes by use case, and apps can request a tier explicitly. Each tie
 - **One node can fail without needing the external API:** that's N+1 redundancy by itself.
 - **H100 caveat:** H100 has no native MXFP4 support and uses a software fallback.
 - **These numbers are estimates.** Before buying, benchmark one GPU with `vllm bench` on the real prompt mix and recalibrate the simulator.
+
+**Pool split (starting point): each node runs 5 Gemma 4 replicas and 3 gpt-oss-120b replicas, so 15 fast + 9 deep across the cluster.**
+- **Every node runs both pools,** so losing a node never takes out a tier.
+- **Assuming about 70% of traffic on the fast tier:**
+
+  | | Fast pool (15 GPUs) | Deep pool (9 GPUs) |
+  |---|---|---|
+  | Normal load | ~57% busy | ~42% busy |
+  | One node lost | ~86% busy | ~64% busy |
+
+- **Rebalancing:** any H200 can run either model, so the split changes by redeploying replicas, which takes minutes. In the meantime, the gateway can spill fast-tier traffic to the deep pool.
+
+#### vLLM arguments per pool
+
+Each Kubernetes pod is one replica on one H200. In production, the **router** balances across pods, so vLLM's `--data-parallel-size` isn't used. It's only used in the single-box simulator setup.
+
+**Fast pool: Gemma 4 26B A4B**
+```bash
+vllm serve google/gemma-4-26B-A4B-it \
+  --tensor-parallel-size 1 \
+  --gpu-memory-utilization 0.90 \
+  --max-num-seqs 256 \
+  --max-model-len 131072 \
+  --enable-chunked-prefill \
+  --enable-prefix-caching \
+  --async-scheduling \
+  --limit-mm-per-prompt '{"image": 8}' \
+  --reasoning-parser gemma4 \
+  --served-model-name gemma4-fast
+```
+| Flag | Why |
+|---|---|
+| `--tensor-parallel-size 1` | ~50 GB of BF16 weights fits on one H200. One GPU per replica gives the best throughput per GPU and the smallest failure domain |
+| `--gpu-memory-utilization 0.90` | ~72 GB left for KV cache |
+| `--max-num-seqs 256` | Batch limit per replica, the same as the simulator |
+| `--max-model-len 131072` | Long documents are cheap on Gemma's sliding-window KV (20 KiB/token past 1K tokens). The gateway caps this lower per route |
+| `--enable-chunked-prefill` | Long document prefills don't stall token generation for the batch |
+| `--enable-prefix-caching` | Shared system prompts and repeated documents skip prefill. The router's prefix affinity depends on it |
+| `--async-scheduling` | Overlaps CPU scheduling with GPU execution |
+| `--limit-mm-per-prompt '{"image": 8}'` | Scanned pages per request, for document understanding |
+| `--reasoning-parser gemma4` | Separates thinking from the answer when thinking is enabled |
+
+For support tooling that uses function calling, add `--tool-call-parser gemma4 --enable-auto-tool-choice` with the Gemma 4 tool chat template from the vLLM recipe.
+
+**Deep pool: gpt-oss-120b**
+```bash
+vllm serve openai/gpt-oss-120b \
+  --tensor-parallel-size 1 \
+  --gpu-memory-utilization 0.90 \
+  --max-num-seqs 256 \
+  --max-model-len 131072 \
+  --max-num-batched-tokens 8192 \
+  --max-cudagraph-capture-size 2048 \
+  --stream-interval 20 \
+  --enable-prefix-caching \
+  --async-scheduling \
+  --tool-call-parser openai --enable-auto-tool-choice \
+  --served-model-name gpt-oss-deep
+```
+| Flag | Why |
+|---|---|
+| `--tensor-parallel-size 1` | ~61 GB of MXFP4 weights fits on one H200. The vLLM recipe says TP=1 gives the best throughput per GPU |
+| `--max-model-len 131072` | gpt-oss's full 128K context |
+| `--max-num-batched-tokens 8192` | Tokens per scheduler step, from vLLM's Hopper recipe. It bounds how much prefill one step can carry, protecting decode latency |
+| `--max-cudagraph-capture-size 2048` | From the Hopper recipe: CUDA graphs cover large batches, which lowers per-step overhead |
+| `--stream-interval 20` | From the Hopper recipe: sends streamed tokens in groups of 20, which lowers CPU overhead at high concurrency |
+| `--enable-prefix-caching` | **Kept on, deliberately.** vLLM's Hopper recipe turns it off for benchmarking, but our router depends on prefix affinity for shared documents. Benchmark both settings on the real mix |
+| `--tool-call-parser openai --enable-auto-tool-choice` | Native function calling for support tooling |
+
+**Reasoning effort** isn't a server flag. The gateway sets `reasoning_effort` per request and per route: `low` by default (challenge #2).
 
 **Supporting hardware:**
 - **Network:** 100–200 GbE is enough. Each replica runs on one GPU, so there's no traffic between GPUs, and InfiniBand isn't needed.

@@ -1,11 +1,11 @@
 # inference-simulator
 
-A local simulation of a self-hosted vLLM inference server: **1× H100 80GB SXM serving Llama-3.1-8B-Instruct (BF16)**.
-No model runs. Timing comes from a small model of the GPU's resources (compute, memory bandwidth, KV cache memory, batch slots), so latency, queueing, batching and utilization behave the way a real deployment would.
+A local simulation of a self-hosted vLLM deployment: **2× H200 141GB, each GPU running a full replica of [Gemma 4 26B A4B](https://huggingface.co/google/gemma-4-26B-A4B-it) (BF16)**, with requests load-balanced across the two.
+No model runs. Timing comes from a small model of each GPU's resources (compute, memory bandwidth, KV cache memory, batch slots) and of the model's real architecture, so latency, queueing, batching and utilization behave the way the real deployment would.
 
 ```
 pip install -r requirements.txt
-uvicorn server:app --port 8000
+uvicorn server:app --host 0.0.0.0 --port 8000
 
 curl -X POST localhost:8000/generate -H "Content-Type: application/json" -d '{"prompt_id": 123}'
 curl localhost:8000/metrics
@@ -16,11 +16,46 @@ locust --host http://localhost:8000 --headless -u 128 -r 32 -t 60s   # headless
 
 | File | What it is |
 |---|---|
-| `server.py` | `POST /generate`, `GET /metrics`, and the simulated engine (about 200 lines) |
+| `server.py` | `POST /generate`, `GET /metrics`, the router and the simulated engines (about 250 lines) |
 | `data/prompts.jsonl` | Dataset: 1000 records |
 | `data/prepare_dataset.py` | Rebuilds the dataset from the source |
 | `locustfile.py` | Stress test: each Locust user is one client sending requests back to back |
 | `monitoring/` | Prometheus with the alert rules, and a Grafana dashboard (Docker Compose) |
+| `SYSTEM_DESIGN.md` | Part 3: the production scaling memo |
+
+## The deployment being simulated
+
+This is the real vLLM command for the hardware the simulator models. Its numbers (batch limit, memory utilization, precision) are the same constants used in `server.py`:
+
+```bash
+vllm serve google/gemma-4-26B-A4B-it \
+  --data-parallel-size 2 \
+  --tensor-parallel-size 1 \
+  --gpu-memory-utilization 0.90 \
+  --max-num-seqs 256 \
+  --max-model-len 32768 \
+  --enable-chunked-prefill \
+  --enable-prefix-caching \
+  --async-scheduling \
+  --limit-mm-per-prompt '{"image": 4}' \
+  --reasoning-parser gemma4 \
+  --served-model-name gemma4-fast
+```
+
+| Flag | Why |
+|---|---|
+| `--data-parallel-size 2` | One full replica per H200, and vLLM load-balances between them. The simulator's router does the same |
+| `--tensor-parallel-size 1` | The 26B MoE (~50 GB BF16) fits on one GPU, so splitting it would only add communication between GPUs |
+| `--gpu-memory-utilization 0.90` | Leaves ~72 GB per GPU for KV cache after weights (`KV_CAPACITY_BYTES`) |
+| `--max-num-seqs 256` | Batch limit per replica (`MAX_NUM_SEQS`) |
+| `--max-model-len 32768` | Caps context to bound KV use per request. Gemma 4 supports up to 256K |
+| `--enable-chunked-prefill` | Long prompts don't stall decoding for the whole batch |
+| `--enable-prefix-caching` | Reuses KV for shared system prompts and repeated documents |
+| `--async-scheduling` | Overlaps CPU scheduling with GPU execution |
+| `--limit-mm-per-prompt '{"image": 4}'` | Allows scanned pages or images in a request, for document understanding |
+| `--reasoning-parser gemma4` | Separates thinking from the answer when thinking is enabled |
+
+For function-calling support tooling, add `--tool-call-parser gemma4 --enable-auto-tool-choice`.
 
 ## Dataset
 
@@ -32,49 +67,65 @@ Each record is `{id, category, prompt, response}`. The prompt is the instruction
 
 | | p50 | p99 | max |
 |---|---|---|---|
-| prompt tokens | 15 | 998 | 1944 |
-| completion tokens | 37 | 549 | 1635 |
+| prompt tokens | 15 | 1020 | 1988 |
+| completion tokens | 38 | 561 | 1672 |
 
 ## Part 1: Inference simulation
 
-**Tokenizer:** `tokens = max(1, round(len(text) / 4.6))`.
-- **Where 4.6 comes from:** I calibrated the ratio by running tiktoken `cl100k_base` over this dataset, which averages 4.58 characters per token. cl100k is the base of Llama 3's 128k vocabulary, so it's a close stand-in for the served model's tokenizer.
-- **Why not the usual `len/4`:** it overcounts this dataset by about 13%.
-- **Limits:** the formula is accurate on average, not per request. Text full of names or non-English words packs fewer characters into each token. For example, the first 200 characters of the Bismarck prompt (id 636) average about 2.9 characters per token, so the formula gives 43 tokens where cl100k counts 68. Tokenizers are model-specific. In production you don't estimate: vLLM returns exact `usage` counts from the served model's own tokenizer.
+**Tokenizer:** `tokens = max(1, round(len(text) / 4.5))`.
+- **Where 4.5 comes from:** I calibrated the ratio by running **Gemma 4's own tokenizer** over this dataset; it averages 4.52 characters per token. Tokenizers are model-specific, so the formula is calibrated against the model being simulated.
+- **Why not the usual `len/4`:** it overcounts this dataset by about 12%.
+- **Limits:** the formula is accurate on average, not per request. Compared with Gemma's tokenizer, the median request is off by about 11%, and 1 in 10 by more than 30%. Text full of names or non-English words packs fewer characters into each token. For example, the opening of the Bismarck prompt (id 636) averages under 3 characters per token. In production you don't estimate: vLLM returns exact `usage` counts from the served model's own tokenizer.
 
-**Engine:** a single asyncio task owns the "GPU" and runs **continuous batching** the way vLLM's scheduler does. Each loop iteration is one engine step. The stages are commented in `server.py`:
+**Router:** each request goes to the replica with the fewest outstanding requests (running plus waiting). That's what vLLM's data-parallel load balancer does. The response includes the `gpu` that served it.
+
+**Engine:** each GPU is an asyncio task running **continuous batching** the way vLLM's scheduler does. Each loop iteration is one engine step. The stages are commented in `server.py`:
 
 | Stage | What happens | Time model |
 |---|---|---|
 | 0. Tokenize | Count prompt tokens (CPU) | Negligible |
 | 1. Schedule | Move waiting requests into the running batch between steps. The limits are `MAX_NUM_SEQS=256` and free KV cache | – |
-| 2. Prefill | Run all newly admitted prompts in one pass and emit their first token. Compute-bound | `1ms + prompt_tokens / 20k tok/s` |
-| 3. Decode | One token for *every* running sequence. Memory-bandwidth-bound: weights are read once per step for the whole batch, plus each sequence's KV cache | `1ms + (16GB weights + KV_tokens × 128KiB) / 3.35 TB/s` |
+| 2. Prefill | Run all newly admitted prompts in one pass and emit their first token. Compute-bound | `1ms + prompt_tokens / 30k tok/s` |
+| 3. Decode | One token for *every* running sequence. Memory-bandwidth-bound: the weights the batch's experts need, plus every sequence's KV cache | `1ms + (dense 4.7GB + experts 45.7GB × touched + KV) / 3.84 TB/s` |
 | 4. Complete | Sequences that reached their length leave the batch and free their KV | – |
 | 5. Detokenize | Return the dataset's reference answer as the "generated" content | Negligible |
 
-Where the constants come from (top of `server.py`):
-- **Decode:** at batch size 1, each step takes about 5.8ms (≈170 tok/s), which is in line with real 8B-on-H100 numbers. Because the weight read is shared by the whole batch, batching multiplies throughput, and the per-token cost rises slowly as KV traffic grows.
-- **KV cache:** 2 (K,V) × 32 layers × 8 KV heads × 128 head dim × 2 bytes = **128 KiB per token**. The pool is (80GB × 0.9 − 16GB weights − 4GB activations) ≈ **397k tokens**.
-- **Prefill:** 2 × 8B FLOPs per token at about 35% MFU of 989 TFLOPS gives about 20k tok/s.
-- **Prefill blocks decode:** prefill steps pause decoding for the running batch, the way vLLM behaves without chunked prefill. This is visible as higher TPOT under load.
+Where the constants come from (top of `server.py`). The model numbers come from Gemma 4's Hugging Face `config.json`:
+- **MoE weights:** 25.2B total and 3.8B active parameters, with 128 experts per layer and 8 routed per token. That works out to about 2.4B always-on parameters (attention, embeddings, vision encoder) and about 22.8B in experts.
+  - **Small batches:** a single sequence reads only 8/128 of the expert weights per step, about 2.9 ms/token (~340 tok/s).
+  - **Large batches:** the share of experts touched is `1 − (1 − 8/128)^batch`. By about 64 sequences almost every expert is read on every step, so decode is bound by reading the full ~50 GB.
+  - **The tradeoff:** MoE saves compute, but at high batch it doesn't save memory bandwidth.
+- **KV cache, hybrid attention:** 25 of the 30 layers use a **1024-token sliding window** (8 KV heads × 256 dim = 200 KiB/token, capped at the window). 5 layers use full attention (2 KV heads × 512 dim = 20 KiB/token, growing with context).
+  - **Short prompts:** a short request costs about 220 KiB/token.
+  - **Long documents:** past 1K tokens, each extra token costs only 20 KiB, so long documents are much cheaper than a dense model's KV would be.
+  - **Pool:** (141 GB × 0.9 − 50 GB weights − 4 GB activations) ≈ **72 GB per GPU**.
+- **Bandwidth:** H200 peak is 4.8 TB/s; the simulator assumes **80% is achievable**. That's the main calibration knob.
+- **Prefill:** 2 × 3.8B FLOPs per token at about 25% MFU of 989 TFLOPS (MoE routing lowers efficiency) gives about 30k tok/s.
+- **Prefill blocks decode:** a prefill step pauses decoding for that replica's batch. This is a conservative stand-in for vLLM's chunked prefill, which interleaves the two. It shows up as higher TPOT under load.
 
-**Response:** `content`, `usage.{prompt_tokens, completion_tokens, total_tokens}`, and `timing.{ttft_s, e2e_s}`.
-**Errors:** an unknown `prompt_id` returns 404. More than 1000 queued requests returns 429, so the server applies backpressure instead of letting the queue grow without limit.
+**Response:** `content`, `usage.{prompt_tokens, completion_tokens, total_tokens}`, `gpu`, and `timing.{ttft_s, e2e_s}`.
+**Errors:** an unknown `prompt_id` returns 404. More than 1000 queued requests (across both GPUs) returns 429, so the server applies backpressure instead of letting the queue grow without limit.
 
 **Simplifications (on purpose):**
-- The KV cache for prompt plus full output is reserved at admission, so there is no paging or preemption. With an 8B model on 80GB, the 256-sequence limit is reached long before the KV cache fills. For a 70B model, KV would become the bottleneck and preemption would need modeling.
-- There is no chunked prefill and no prefix caching.
+- **No paging or preemption:** the KV cache for prompt plus full output is reserved at admission.
+  - **This dataset:** requests are short (about 165 tokens), so a full batch of 256 uses about 13% of the KV pool. The 256 batch limit is what binds.
+  - **4K-token documents:** 256 sequences would need about 73 GB, more than the pool. KV would then become the limit and `KVCachePressure` would fire.
+- No chunked prefill and no prefix caching.
+- K and V are counted separately on the full-attention layers. The config's `attention_k_eq_v` may halve that, so KV numbers are slightly conservative.
 - Timing runs on a virtual GPU clock, so OS timer jitter (about 15ms on Windows) doesn't add up over many steps.
 
 ### What it shows (Locust, this laptop)
 
-| Users | req/s | output tok/s | mean TPOT | median E2E | GPU busy |
+| Users | req/s | output tok/s | mean TPOT | median E2E | GPUs busy |
 |---|---|---|---|---|---|
-| 1 | 2.6 | ~150 | 5.8 ms | 170 ms | ~87% |
-| 128 | 103 | ~8,000 | ~14 ms | 560 ms | ~97% |
+| 1 | 3.7 | ~300 | 3.0 ms | 120 ms | GPU0 ~89%, GPU1 idle |
+| 128 | 85 | ~6,700 | ~18 ms | 680 ms | both ~94% |
+| 512 | 211 | ~15,900 | ~28 ms | 1.1 s | both saturated |
+| 800 | 231 | – | – | 2.3 s | saturated; 288 waiting, `QueueBacklog` and `TTFTHigh` firing |
 
-Going from 1 to 128 users gives about 50× the throughput, while per-token latency only rises about 2.5×. This is the main economic argument for self-hosting with batching. Above about 256 concurrent users, requests start queueing, and TTFT and E2E grow without bound. That point is where a second GPU is needed.
+Going from 1 to 512 users gives about **57× the throughput**, while per-token latency rises about 9×.
+- **Why latency rises more than for a dense model:** a single MoE sequence is very cheap, but a full batch reads every expert. Each token still streams at about 36 tok/s per user, well inside the 50 ms TPOT alert threshold.
+- **The limit:** above about **512 concurrent users** (2 × 256), requests queue, and TTFT and E2E grow without bound. That's the point where a third GPU is needed.
 
 ## Part 2: Observability (`GET /metrics`)
 
@@ -92,7 +143,9 @@ The output is in Prometheus text format, so it can be scraped as-is. The metric 
 | `sim_decode_batch_size` | histogram | Batching efficiency. A small batch at high load points to a scheduling problem |
 | `sim_prompt_tokens_total`, `sim_generation_tokens_total` | counter | Token throughput. This is the cost basis compared with per-token API pricing |
 | `sim_requests_total{status}` | counter | Success, rejected (429), and not-found counts |
-| `sim_kv_cache_capacity_tokens` | gauge | Context for the usage ratio |
+| `sim_kv_cache_capacity_bytes` | gauge | KV pool size per GPU, as context for the usage ratio |
+
+Per-replica gauges and GPU busy carry a `gpu` label, so a single hot or idle GPU is visible. Latency histograms are fleet-wide, which is what users experience.
 
 Choices:
 - **Histograms rather than averages,** because latency SLOs are about p95/p99 and averages hide the tail. The buckets cover 10ms to 60s.
@@ -109,7 +162,7 @@ Choices:
 | KV cache pressure | `kv_cache_usage_ratio > 0.9` for 5m | Preemption is coming. Reduce concurrency or max context, or add memory or GPUs |
 | Rejections | `rate(requests_total{status="rejected"}) > 0` | Load is being shed and users are getting errors. Page someone |
 | Error rate | non-ok / total > 1% | Something is broken |
-| Low utilization | `rate(gpu_busy) < 0.3` for 1h during business hours | Paying for an idle H100. Consolidate the workload or shrink the fleet |
+| Low utilization | `rate(gpu_busy) < 0.3` for 1h during business hours | Paying for idle H200s. Consolidate the workload or shrink the fleet |
 
 These rules are implemented in [`monitoring/alerts.yml`](monitoring/alerts.yml). Their `for` durations are shortened so the alerts fire within a demo; each rule's `production_for` annotation holds the production value.
 
@@ -118,7 +171,7 @@ These rules are implemented in [`monitoring/alerts.yml`](monitoring/alerts.yml).
 ```
 uvicorn server:app --host 0.0.0.0 --port 8000        # 0.0.0.0 so the Prometheus container can scrape it
 docker compose -f monitoring/docker-compose.yml up -d
-locust --host http://localhost:8000 --headless -u 400 -r 100 -t 120s   # past the 256 batch limit
+locust --host http://localhost:8000 --headless -u 800 -r 200 -t 120s   # past the 2 x 256 batch limit
 ```
 
 **Grafana** (http://localhost:3000) opens the "LLM Inference Simulator" dashboard, with no login:
@@ -128,7 +181,7 @@ locust --host http://localhost:8000 --headless -u 400 -r 100 -t 120s   # past th
 
 **Prometheus** (http://localhost:9090/alerts) shows the raw alert rule states.
 
-With 400 users, `QueueBacklog` and `TTFTHigh` fire within about a minute. `GPUUnderutilized` fires when the simulator sits idle. `KVCachePressure` never fires with an 8B model, because the 256-sequence limit is reached first, as explained above.
+With 800 users, `QueueBacklog` and `TTFTHigh` fire within about a minute. `GPUUnderutilized` fires when the simulator sits idle. `KVCachePressure` doesn't fire with this short-prompt dataset, because the 256 batch limit is reached first. It would fire with 4K-token documents, as explained above.
 
 For dashboards, I'd also watch the following (no alerts needed):
 - request rate by category
