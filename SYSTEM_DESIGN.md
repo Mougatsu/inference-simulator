@@ -54,7 +54,11 @@
 
 ```mermaid
 flowchart LR
-  A[Apps<br/>summarization · docs · support] -->|OpenAI-compatible API| G[LiteLLM gateway<br/>2+ replicas]
+  U[User] -->|OIDC login| IDP[Company IdP<br/>Okta / Entra ID]
+  IDP -->|access token JWT| A
+  A[Apps<br/>summarization · docs · support] -->|OpenAI-compatible API<br/>+ Bearer JWT| G[LiteLLM gateway<br/>2+ replicas]
+  G -.->|JWKS, cached| IDP
+  G -->|per-user usage log| L[(Usage store<br/>Postgres / ClickHouse)]
   G -->|non-sensitive overflow only| X[External API]
   G --> Q[Async queue<br/>batch summarization]
   Q --> R
@@ -64,15 +68,23 @@ flowchart LR
   R --> V3[vLLM replica 24]
 ```
 
-1. **App → gateway:** the app calls the **LiteLLM gateway** with a per-team key. One OpenAI-compatible API means apps don't change when the model changes.
-2. **Gateway:**
-   - authenticates the request and enforces team quotas and rate limits
+1. **User → app (OAuth 2.0 / OIDC):** users sign in to the app through the company identity provider (Okta or Entra ID).
+   - **User-facing calls:** the app forwards the user's **access token (JWT)** to the gateway. When the app calls on the user's behalf from a backend, it exchanges the token on-behalf-of the user (RFC 8693), so the user's identity is kept.
+   - **Batch jobs with no user:** these authenticate as a **service identity** (OAuth client credentials).
+   - **No shared static keys:** every request carries a verifiable identity.
+2. **App → gateway:** the app calls the **LiteLLM gateway** through one OpenAI-compatible API, so apps don't change when the model changes.
+3. **Gateway:**
+   - **validates the JWT locally:** signature checked against the identity provider's **cached JWKS** (its published signing keys), plus `aud` and `exp`
+   - extracts **user (`sub`), team (group claim) and app (`azp`)**
+   - LiteLLM's JWT auth does this. If that tier isn't licensed, a JWT filter at an Envoy or API gateway layer in front of it does the same job and passes the identity on as headers.
+   - enforces **per-user and per-team** quotas and rate limits
    - assigns a priority: interactive support ranks above document understanding, which ranks above batch summarization
    - picks the model and route for the use case
    - enforces the **compliance rule:** requests tagged sensitive never go to the external API
-3. **Async traffic:** batch summarization that isn't time-sensitive goes to a **queue** and is processed when there's capacity.
-4. **Router → replica:** the **router** (vLLM production-stack router or llm-d) picks a vLLM replica.
-5. **vLLM** runs the request with chunked prefill, prefix caching and FP8 KV cache. It returns the output with exact token `usage`, from the model's own tokenizer.
+4. **Async traffic:** batch summarization that isn't time-sensitive goes to a **queue** and is processed when there's capacity.
+5. **Router → replica:** the **router** (vLLM production-stack router or llm-d) picks a vLLM replica.
+6. **vLLM** runs the request with chunked prefill, prefix caching and FP8 KV cache. It returns the output with exact token `usage`, from the model's own tokenizer.
+7. **Usage record:** on the way back, the gateway writes one record per request with **user, team, app, route, model, prompt and completion tokens, latency, status and cost**.
 
 ### Load balancing strategy
 
@@ -89,7 +101,14 @@ flowchart LR
   - collected by **Prometheus**, with Mimir for HA and long retention
   - shown in **Grafana**: the simulator dashboard plus a per-replica view
   - routed through **Alertmanager** to PagerDuty and Slack
-- **Logs:** structured per-request logs from the gateway (request ID, team, model, tokens, latency, `finish_reason`) go to Loki. **They contain no prompt or output text**, for compliance.
+- **Per-user usage:** the authenticated identity from the gateway makes per-user usage visible.
+  - **Usage store:** one record per request (user, team, app, model, tokens, latency, cost, `finish_reason`) in Postgres or ClickHouse. LiteLLM's spend logs work for this.
+  - **Usage views:** Grafana shows usage per user, team and app, and drives chargeback, quota enforcement and abuse detection, such as one user running a script that burns 30% of GPU time.
+  - **The user ID never becomes a Prometheus label.** Thousands of users would mean thousands of time series and overload Prometheus. Prometheus keeps low-cardinality labels (team, app, route); per-user detail lives in the usage store and logs.
+- **Logs:** structured per-request logs from the gateway (request ID, user ID, team, model, tokens, latency, `finish_reason`) go to Loki.
+  - **They contain no prompt or output text**, for compliance.
+  - The user is identified by the pseudonymous `sub` claim, not an email address.
+  - Access to usage data is role-restricted and has a set retention period.
 - **Tracing:** OpenTelemetry traces app → gateway → router → vLLM, so one slow request can be traced to queueing, prefill or decode.
 - **SLOs:** p95 TTFT, p95 TPOT and success rate per route. Alerting is based on how fast the error budget is used up.
 - **Cost:** a cost-per-million-tokens dashboard compared against the old API bill. That's the business case, measured.
@@ -107,7 +126,8 @@ flowchart LR
 | 5 | **Slow scale-up.** A new GPU node takes minutes to start, and the weights are about 61 GB | Scale on queue depth and KV usage, not CPU; keep warm headroom (51% normal load); pre-pulled images and weights cached on NVMe; reserved capacity for the base load |
 | 6 | **Noisy neighbours** between teams | Per-team quotas, priority classes, and separate pools if one team's traffic shape hurts others |
 | 7 | **Model and config upgrades** | Canary releases through weighted routing at the gateway, gated by the evaluation suite; pinned model versions; the previous version kept deployable for rollback |
-| 8 | **Traffic growth** beyond 10k/min | Add nodes, since replicas are independent and capacity grows linearly. Recalibrate the simulator with production metrics to plan each step |
+| 8 | **Auth on the critical path.** At 167 req/s, calling the identity provider per request adds latency and makes the provider a single point of failure | Validate JWTs locally against cached JWKS, with no identity provider call per request. Refresh signing keys in the background, so an identity provider outage doesn't stop inference until tokens expire. Use short-lived tokens of about 15 minutes |
+| 9 | **Traffic growth** beyond 10k/min | Add nodes, since replicas are independent and capacity grows linearly. Recalibrate the simulator with production metrics to plan each step |
 
 ---
 
