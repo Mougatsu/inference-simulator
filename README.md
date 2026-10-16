@@ -3,15 +3,55 @@
 A local simulation of a self-hosted vLLM deployment: **2× H200 141GB, each GPU running a full replica of [Gemma 4 26B A4B](https://huggingface.co/google/gemma-4-26B-A4B-it) (BF16)**, with requests load-balanced across the two.
 No model runs. Timing comes from a small model of each GPU's resources (compute, memory bandwidth, KV cache memory, batch slots) and of the model's real architecture, so latency, queueing, batching and utilization behave the way the real deployment would.
 
+## Quick start
+
+**You need:** Python 3.11+ and Docker Desktop (Docker is only needed for the dashboard).
+
+**1. Install**
 ```
 pip install -r requirements.txt
+```
+
+**2. Start the simulator** (terminal 1, leave it running)
+```
 uvicorn server:app --host 0.0.0.0 --port 8000
+```
 
+**3. Start the dashboard** (terminal 2)
+```
+docker compose -f monitoring/docker-compose.yml up -d
+```
+- **Grafana:** http://localhost:3000 opens the "LLM Inference Simulator" dashboard, no login needed.
+- **Prometheus alerts:** http://localhost:9090/alerts
+
+**4. Send one request**
+```bash
+# macOS / Linux / Git Bash
 curl -X POST localhost:8000/generate -H "Content-Type: application/json" -d '{"prompt_id": 123}'
-curl localhost:8000/metrics
+```
+```powershell
+# Windows PowerShell
+Invoke-RestMethod -Method Post -Uri http://localhost:8000/generate -ContentType 'application/json' -Body '{"prompt_id": 123}'
+```
+The response contains the content, token counts, which GPU served it, and the timing. Raw metrics are at http://localhost:8000/metrics.
 
-locust --host http://localhost:8000                                   # UI at http://localhost:8089
-locust --host http://localhost:8000 --headless -u 128 -r 32 -t 60s   # headless
+**5. Put it under load**
+```
+locust --host http://localhost:8000
+```
+Open http://localhost:8089 and start a test, then watch Grafana:
+
+| Users | What you'll see |
+|---|---|
+| **128** | Normal load: both GPUs busy, latency low, no alerts |
+| **800** | Overload, past the 2 × 256 batch limit. Requests queue, TTFT climbs, and `QueueBacklog` and `TTFTHigh` fire within about a minute |
+
+To run without the UI: `locust --host http://localhost:8000 --headless -u 800 -r 200 -t 120s`
+
+**6. Stop**
+Press Ctrl+C in terminal 1, then run:
+```
+docker compose -f monitoring/docker-compose.yml down
 ```
 
 | File | What it is |
