@@ -4,6 +4,7 @@ Run: uvicorn server:app --port 8000
 """
 import asyncio
 import json
+import logging
 import time
 from collections import deque
 from pathlib import Path
@@ -151,6 +152,7 @@ async def engine_loop():
 
 
 app = FastAPI(title="LLM Inference Simulator")
+log = logging.getLogger("uvicorn.error")  # uvicorn's own logger, so lines show in the server output
 
 
 @app.on_event("startup")
@@ -174,6 +176,8 @@ async def generate(req: GenerateRequest):
 
     # --- Stage 0: tokenization (CPU, negligible next to GPU time) ---------------------
     seq = Seq(record)
+    # ponytail: truncated so one request = one log line; contexts run up to ~9k chars
+    log.info("prompt_id=%d tokens=%d prompt=%r", req.prompt_id, seq.prompt_tokens, record["prompt"][:200])
     waiting.append(seq)
     WAITING.set(len(waiting))
     wake.set()
