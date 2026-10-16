@@ -25,13 +25,16 @@ docker compose -f monitoring/docker-compose.yml up -d
 - **Prometheus alerts:** http://localhost:9090/alerts
 
 **4. Send one request**
-```bash
-# macOS / Linux / Git Bash
-curl -X POST localhost:8000/generate -H "Content-Type: application/json" -d '{"prompt_id": 123}'
-```
+
+On **Windows PowerShell:**
 ```powershell
-# Windows PowerShell
 Invoke-RestMethod -Method Post -Uri http://localhost:8000/generate -ContentType 'application/json' -Body '{"prompt_id": 123}'
+```
+> Don't use `curl` in PowerShell. There it's an alias for `Invoke-WebRequest`, which rejects curl's `-H` and `-d` flags.
+
+On **macOS, Linux or Git Bash:**
+```bash
+curl -X POST localhost:8000/generate -H "Content-Type: application/json" -d '{"prompt_id": 123}'
 ```
 The response contains the content, token counts, which GPU served it, and the timing. Raw metrics are at http://localhost:8000/metrics.
 
