@@ -2,3 +2,4 @@ fastapi==0.115.6
 uvicorn==0.34.0
 prometheus_client==0.26.0
 locust==2.32.4
+tiktoken==0.8.0

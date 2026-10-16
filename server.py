@@ -9,6 +9,7 @@ import time
 from collections import deque
 from pathlib import Path
 
+import tiktoken
 from fastapi import FastAPI, HTTPException, Response
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
 from pydantic import BaseModel
@@ -27,9 +28,13 @@ STEP_OVERHEAD_S = 0.001                      # scheduler + kernel launch per eng
 MAX_QUEUE = 1000                             # backpressure: reject with 429 beyond this
 
 
+# Tokenizer: tiktoken's cl100k_base. Llama 3's 128k vocab is cl100k's 100k BPE merges plus 28k extra,
+# so counts land within a few % of the real model tokenizer without downloading gated Llama files.
+ENCODING = tiktoken.get_encoding("cl100k_base")
+
+
 def count_tokens(text: str) -> int:
-    # Tokenizer approximation: ~4 characters per token, the usual rule of thumb for English BPE.
-    return max(1, round(len(text) / 4))
+    return max(1, len(ENCODING.encode(text, disallowed_special=())))
 
 
 # ---------------------------------------------------------------------------

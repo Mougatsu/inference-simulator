@@ -31,12 +31,12 @@ Each record is `{id, category, prompt, response}`. The prompt is the instruction
 
 | | p50 | p99 | max |
 |---|---|---|---|
-| prompt tokens | 17 | 1147 | 2236 |
-| completion tokens | 42 | 631 | 1880 |
+| prompt tokens | 15 | 969 | 1748 |
+| completion tokens | 40 | 540 | 1592 |
 
 ## Part 1: Inference simulation
 
-**Tokenizer:** `tokens = round(len(text) / 4)`. This is the common rule of thumb for English BPE tokenizers (about 4 chars per token for the Llama 3 and GPT tokenizers). It is cheap, deterministic, and accurate to within about 10–20% on English prose, which is good enough for capacity planning.
+**Tokenizer:** [tiktoken](https://github.com/openai/tiktoken) `cl100k_base`. Llama 3's 128k vocabulary is built on cl100k's 100k BPE merges plus 28k extra tokens, so the counts land within a few percent of the real model's tokenizer. Using it avoids downloading the gated Llama tokenizer files. Earlier versions used a `len(text) / 4` heuristic, which can be off by 10–20% per request.
 
 **Engine:** a single asyncio task owns the "GPU" and runs **continuous batching** the way vLLM's scheduler does. Each loop iteration is one engine step. The stages are commented in `server.py`:
 
