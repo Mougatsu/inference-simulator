@@ -70,10 +70,10 @@ Where the constants come from (top of `server.py`):
 
 | Users | req/s | output tok/s | mean TPOT | median E2E | GPU busy |
 |---|---|---|---|---|---|
-| 1 | 1.65 | ~170 | 5.8 ms | 280 ms | ~89% |
-| 128 | 88 | ~7,900 | ~14 ms | 660 ms | ~100% |
+| 1 | 2.6 | ~150 | 5.8 ms | 170 ms | ~87% |
+| 128 | 103 | ~8,000 | ~14 ms | 560 ms | ~97% |
 
-Going from 1 to 128 users gives about 45× the throughput, while per-token latency only rises about 2.5×. This is the main economic argument for self-hosting with batching. Above about 256 concurrent users, requests start queueing, and TTFT and E2E grow without bound. That point is where a second GPU is needed.
+Going from 1 to 128 users gives about 50× the throughput, while per-token latency only rises about 2.5×. This is the main economic argument for self-hosting with batching. Above about 256 concurrent users, requests start queueing, and TTFT and E2E grow without bound. That point is where a second GPU is needed.
 
 ## Part 2: Observability (`GET /metrics`)
 
